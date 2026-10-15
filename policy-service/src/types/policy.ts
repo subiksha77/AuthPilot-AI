@@ -22,6 +22,7 @@ export interface Policy {
   coPaymentPercent: number;       // % of eligible amount borne by member (0–100)
   exclusions: string[];           // List of excluded conditions or services
   requiredDocuments: string[];    // Documents required to process any claim
+  premium?: number;               // Annual or monthly premium in INR (if specified)
   createdAt: string;              // ISO timestamp of policy record creation
   _syntheticDemo: true;           // Required marker — all policies here are demo data only
 }

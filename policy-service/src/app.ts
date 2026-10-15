@@ -9,12 +9,23 @@
  *   GET  /api/claims/:claimId          — Get claim by ID
  *   POST /api/evaluate                 — Evaluate a claim against a policy
  *   POST /api/estimate                 — Estimate coverage for a claim
- *   POST /api/review                   — Submit claim for reviewer workflow
+ *   POST /api/policy-radar             — Compare policy versions / products (Policy Radar)
+ *   POST /api/policies/compare         — Alias for policy-radar
+ *   POST /api/simulate                 — What-If scenario simulator
+ *   GET  /api/review                   — List all review cases
+ *   POST /api/review                   — Submit/create a review case
+ *   GET  /api/review/:caseId           — Get details of a review case
+ *   POST /api/review/:caseId/transition— Execute reviewer state transition
+ *   GET  /api/review/:caseId/audit     — Get audit trail of a review case
  */
 
 import express, { Request, Response, NextFunction } from "express";
 import { evaluateClaim } from "./rules/engine.js";
 import { estimateCoverage } from "./estimator/coverageCalculator.js";
+import { comparePolicies } from "./radar/comparator.js";
+import { simulateScenario, SimulationValidationError } from "./simulator/simulator.js";
+import { defaultReviewRepository } from "./reviewer/repository.js";
+import { WorkflowValidationError } from "./reviewer/stateMachine.js";
 import {
   SYNTHETIC_POLICIES,
   getPolicyById,
@@ -22,6 +33,8 @@ import {
 import { SYNTHETIC_CLAIMS, getClaimById } from "./data/syntheticClaims.js";
 import type { Claim } from "./types/claim.js";
 import type { Policy } from "./types/policy.js";
+import type { SimulationModifications } from "./types/simulator.js";
+import type { TransitionRequest } from "./types/reviewer.js";
 
 export const app = express();
 
@@ -160,13 +173,136 @@ app.post("/api/estimate", (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Reviewer Workflow — Submit for Human Review
+// Policy Radar — Compare Policy Versions / Products
 // ─────────────────────────────────────────────────────────────────────────────
+const handlePolicyComparison = (req: Request, res: Response) => {
+  const {
+    baselinePolicyId,
+    targetPolicyId,
+    baselinePolicy: rawBaseline,
+    targetPolicy: rawTarget,
+  } = req.body as {
+    baselinePolicyId?: string;
+    targetPolicyId?: string;
+    baselinePolicy?: Partial<Policy>;
+    targetPolicy?: Partial<Policy>;
+  };
+
+  let baseline = rawBaseline;
+  let target = rawTarget;
+
+  if (baselinePolicyId) {
+    const found = getPolicyById(baselinePolicyId);
+    if (!found) {
+      res.status(404).json({ error: `Baseline policy "${baselinePolicyId}" not found.` });
+      return;
+    }
+    baseline = found;
+  }
+
+  if (targetPolicyId) {
+    const found = getPolicyById(targetPolicyId);
+    if (!found) {
+      res.status(404).json({ error: `Target policy "${targetPolicyId}" not found.` });
+      return;
+    }
+    target = found;
+  }
+
+  if (!baseline && !target) {
+    res.status(400).json({
+      error: "Specify baseline and target policies via IDs (baselinePolicyId, targetPolicyId) or inline policy objects.",
+    });
+    return;
+  }
+
+  const result = comparePolicies(baseline, target);
+  res.json(result);
+};
+
+app.post("/api/policy-radar", handlePolicyComparison);
+app.post("/api/policies/compare", handlePolicyComparison);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// What-If Simulator — Simulate Hypothetical Scenarios
+// ─────────────────────────────────────────────────────────────────────────────
+app.post("/api/simulate", (req: Request, res: Response) => {
+  const {
+    claimId,
+    policyId,
+    claim: rawClaim,
+    policy: rawPolicy,
+    modifications,
+  } = req.body as {
+    claimId?: string;
+    policyId?: string;
+    claim?: Claim;
+    policy?: Policy;
+    modifications?: SimulationModifications;
+  };
+
+  if (!modifications || typeof modifications !== "object") {
+    res.status(400).json({ error: "modifications object is required for simulation." });
+    return;
+  }
+
+  let claim: Claim | undefined;
+  let policy: Policy | undefined;
+
+  if (claimId) claim = getClaimById(claimId);
+  if (!claim && rawClaim) claim = rawClaim;
+
+  if (policyId) policy = getPolicyById(policyId);
+  if (!policy && rawPolicy) policy = rawPolicy;
+
+  if (!claim) {
+    res.status(400).json({ error: "Provide claimId or a full claim object." });
+    return;
+  }
+  if (!policy) {
+    res.status(400).json({ error: "Provide policyId or a full policy object." });
+    return;
+  }
+
+  let alternatePolicy: Policy | undefined;
+  if (modifications.alternatePolicyId) {
+    alternatePolicy = getPolicyById(modifications.alternatePolicyId);
+    if (!alternatePolicy) {
+      res.status(404).json({ error: `Alternate policy "${modifications.alternatePolicyId}" not found.` });
+      return;
+    }
+  }
+
+  try {
+    const result = simulateScenario(claim, policy, modifications, alternatePolicy);
+    res.json(result);
+  } catch (err) {
+    if (err instanceof SimulationValidationError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    const message = err instanceof Error ? err.message : "Unexpected simulation error.";
+    res.status(500).json({ error: message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reviewer Workflow — Cases, State Machine & Audit History
+// ─────────────────────────────────────────────────────────────────────────────
+
+// List all review cases
+app.get("/api/review", (_req: Request, res: Response) => {
+  const cases = defaultReviewRepository.listCases();
+  res.json({ cases, count: cases.length });
+});
+
+// Submit / Create new review case
 app.post("/api/review", (req: Request, res: Response) => {
-  const { claimId, policyId, reviewerNotes } = req.body as {
+  const { claimId, policyId, reviewerNotes, assignedReviewerId } = req.body as {
     claimId?: string;
     policyId?: string;
     reviewerNotes?: string;
+    assignedReviewerId?: string;
   };
 
   if (!claimId || !policyId) {
@@ -186,25 +322,89 @@ app.post("/api/review", (req: Request, res: Response) => {
     return;
   }
 
-  // Produce preliminary evaluation and estimation for the reviewer's reference
-  const evaluation = evaluateClaim(claim, policy);
-  const estimation = estimateCoverage(claim, policy);
+  try {
+    const reviewCase = defaultReviewRepository.createCase(
+      claimId,
+      policyId,
+      reviewerNotes,
+      assignedReviewerId
+    );
 
-  const reviewPackage = {
-    reviewStatus: "PENDING_REVIEWER",
-    claimId,
-    policyId,
-    submittedAt: new Date().toISOString(),
-    reviewerNotes: reviewerNotes ?? null,
-    preliminaryEvaluation: evaluation,
-    coverageEstimation: estimation,
-    notice:
-      "This is a PRELIMINARY assessment package for an authorized reviewer. " +
-      "No automated approval or rejection has been issued. " +
-      "The reviewer is responsible for the final decision.",
-  };
+    // Maintain backwards compatibility with Phase 1 response while adding caseId and audit trail
+    const responsePayload = {
+      caseId: reviewCase.caseId,
+      reviewStatus: reviewCase.currentStatus,
+      claimId: reviewCase.claimId,
+      policyId: reviewCase.policyId,
+      submittedAt: reviewCase.createdAt,
+      reviewerNotes: reviewCase.reviewerNotes,
+      assignedReviewerId: reviewCase.assignedReviewerId,
+      preliminaryEvaluation: reviewCase.preliminaryEvaluation,
+      coverageEstimation: reviewCase.coverageEstimation,
+      informationRequests: reviewCase.informationRequests,
+      auditHistory: reviewCase.auditHistory,
+      notice: reviewCase.notice,
+    };
 
-  res.status(202).json(reviewPackage);
+    res.status(202).json(responsePayload);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Error creating review case.";
+    res.status(500).json({ error: message });
+  }
+});
+
+// Get review case by ID
+app.get("/api/review/:caseId", (req: Request, res: Response) => {
+  const reviewCase = defaultReviewRepository.getCase(req.params.caseId);
+  if (!reviewCase) {
+    res.status(404).json({ error: `Review case "${req.params.caseId}" not found.` });
+    return;
+  }
+  res.json(reviewCase);
+});
+
+// Execute state transition on a review case
+app.post("/api/review/:caseId/transition", (req: Request, res: Response) => {
+  const transition = req.body as TransitionRequest;
+  if (!transition || !transition.action) {
+    res.status(400).json({ error: "Action is required for state transition." });
+    return;
+  }
+
+  try {
+    const updatedCase = defaultReviewRepository.transitionCase(req.params.caseId, transition);
+    res.json(updatedCase);
+  } catch (err) {
+    if (err instanceof WorkflowValidationError) {
+      res.status(400).json({ error: err.message });
+      return;
+    }
+    if (err instanceof Error && err.message.includes("not found")) {
+      res.status(404).json({ error: err.message });
+      return;
+    }
+    const message = err instanceof Error ? err.message : "Unexpected workflow transition error.";
+    res.status(500).json({ error: message });
+  }
+});
+
+// Get audit history for a review case
+app.get("/api/review/:caseId/audit", (req: Request, res: Response) => {
+  try {
+    const auditHistory = defaultReviewRepository.getAuditHistory(req.params.caseId);
+    res.json({
+      caseId: req.params.caseId,
+      count: auditHistory.length,
+      auditHistory,
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("not found")) {
+      res.status(404).json({ error: err.message });
+      return;
+    }
+    const message = err instanceof Error ? err.message : "Error retrieving audit history.";
+    res.status(500).json({ error: message });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
